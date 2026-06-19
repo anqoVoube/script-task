@@ -1,16 +1,19 @@
 //! Fetch an Upbit notice and report whether a phrase (default "Market Support")
-//! appears in it.
+//! appears in it — preferring the English rendering.
 //!
-//! The public notice page (www.upbit.com/service_center/notice?id=N) is an empty
-//! React shell: the real title/body is loaded over XHR from the api-manager JSON
-//! API. So by default we hit the JSON API first and fall back to the share page.
+//! The public page (www.upbit.com/service_center/notice?id=N) is an empty React
+//! shell; the real title/body comes from the api-manager JSON API. That API
+//! serves Korean by default. To get English we try, in order, the language
+//! query-param variants Upbit's web client uses and an English `Accept-Language`
+//! header, then pick whichever response actually comes back in English.
 //!
 //! Usage:
-//!   upbit-notice                      # id 6303, term "Market Support"
-//!   upbit-notice 6303                 # explicit id
+//!   upbit-notice                              # id 6303, "Market Support", English
 //!   upbit-notice 6303 "Market Support"
-//!   upbit-notice "https://www.upbit.com/service_center/notice?id=6303&view=share"
-//!   upbit-notice "<full-url>" "some phrase"
+//!   upbit-notice 6303 --lang ko               # force Korean
+//!   upbit-notice 6303 --probe                 # try every variant, show a table
+//!   upbit-notice 6303 --raw                   # also dump the chosen response body
+//!   upbit-notice "<full-url>" "phrase"
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -26,25 +29,54 @@ const DEFAULT_TERM: &str = "Market Support";
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    let first = args.next();
-    let second = args.next();
+#[derive(Clone, Copy, PartialEq)]
+enum Lang {
+    En,
+    Ko,
+}
 
-    // Resolve target id-or-url and the search term.
-    let (targets, label) = match first.as_deref() {
-        Some(u) if u.starts_with("http://") || u.starts_with("https://") => {
-            (vec![u.to_string()], u.to_string())
+impl Lang {
+    /// Accept-Language header value.
+    fn accept(self) -> &'static str {
+        match self {
+            Lang::En => "en-US,en;q=0.9,ko;q=0.5",
+            Lang::Ko => "ko-KR,ko;q=0.9,en;q=0.5",
         }
-        Some(id) => (targets_for_id(id), format!("id={id}")),
-        None => (targets_for_id(DEFAULT_ID), format!("id={DEFAULT_ID}")),
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Lang::En => "en",
+            Lang::Ko => "ko",
+        }
+    }
+}
+
+struct Opts {
+    target: String, // numeric id or a full URL
+    is_url: bool,
+    term: String,
+    lang: Lang,
+    raw: bool,
+    probe: bool,
+}
+
+fn main() -> ExitCode {
+    let opts = match parse_args() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
     };
-    let term = second.unwrap_or_else(|| DEFAULT_TERM.to_string());
 
-    println!("Target : {label}");
-    println!("Phrase : \"{term}\" (case-insensitive)\n");
+    println!(
+        "Target : {}\nPhrase : \"{}\" (case-insensitive)\nLang   : {}\n",
+        opts.target,
+        opts.term,
+        opts.lang.label()
+    );
 
-    let client = match build_client() {
+    let client = match build_client(opts.lang) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: could not build HTTP client: {e}");
@@ -52,72 +84,139 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut total_matches = 0usize;
-    let mut any_success = false;
+    let urls = if opts.is_url {
+        vec![opts.target.clone()]
+    } else {
+        candidates(&opts.target, opts.lang)
+    };
 
-    for url in &targets {
+    if opts.probe {
+        return probe(&client, &urls, &opts.term);
+    }
+
+    // Search mode: fetch candidates in order, keep the first that succeeds, but
+    // prefer one whose body actually reads as the requested language.
+    let mut chosen: Option<(String, String)> = None; // (url, body)
+    for url in &urls {
         println!("── GET {url}");
         match fetch(&client, url) {
             Ok(body) => {
-                any_success = true;
+                let detected = detect_lang(&body);
+                println!("   detected language: {detected}");
                 if looks_like_cloudflare_block(&body) {
-                    println!(
-                        "   ! response looks like a Cloudflare challenge/block \
-                         (your IP may still be flagged — use the VPN/server you intended)\n"
-                    );
+                    println!("   ! Cloudflare challenge — IP may still be flagged");
                 }
-                if let Some(title) = json_title(&body) {
-                    println!("   title: {title}");
+                let want = opts.lang.label();
+                let is_match = detected == want;
+                // Remember the first success; upgrade if a later one matches lang.
+                let upgrade = match &chosen {
+                    None => true,
+                    Some((_, prev)) => is_match && detect_lang(prev) != want,
+                };
+                if upgrade {
+                    chosen = Some((url.clone(), body));
                 }
-                let hits = find_ci_ascii(&body, &term);
-                println!("   {} byte(s) received, {} match(es)", body.len(), hits.len());
-                for (n, &at) in hits.iter().enumerate() {
-                    println!("     [{}] …{}…", n + 1, context(&body, at, term.len(), 70));
+                if is_match {
+                    break; // got the language we wanted — stop early
                 }
-                total_matches += hits.len();
-                println!();
             }
-            Err(e) => {
-                println!("   ! fetch failed: {e}\n");
-            }
+            Err(e) => println!("   ! fetch failed: {e}"),
         }
+        println!();
     }
 
-    if !any_success {
-        eprintln!("All requests failed (geo-block / network). Run this where the URL is reachable.");
+    let Some((url, body)) = chosen else {
+        eprintln!("\nAll requests failed (geo-block / network). Run where Upbit is reachable.");
         return ExitCode::FAILURE;
+    };
+
+    println!("\n══ using: {url}");
+    if let Some(title) = json_title(&body) {
+        println!("   title: {title}");
+    }
+    let detected = detect_lang(&body);
+    if detected != opts.lang.label() {
+        println!(
+            "   ! wanted {} but best response looks {detected} — \
+             run with --probe to see all variants",
+            opts.lang.label()
+        );
+    }
+    if opts.raw {
+        println!("\n----- raw body -----\n{body}\n--------------------\n");
     }
 
-    println!("══════════════════════════════════════════");
-    if total_matches > 0 {
-        println!("RESULT: \"{term}\" FOUND — {total_matches} occurrence(s).");
+    let hits = find_ci_ascii(&body, &opts.term);
+    println!("   {} byte(s), {} match(es)", body.len(), hits.len());
+    for (n, &at) in hits.iter().enumerate() {
+        println!("     [{}] …{}…", n + 1, context(&body, at, opts.term.len(), 70));
+    }
+
+    println!("\n══════════════════════════════════════════");
+    if hits.is_empty() {
+        println!("RESULT: \"{}\" NOT found.", opts.term);
+        ExitCode::from(2)
+    } else {
+        println!("RESULT: \"{}\" FOUND — {} occurrence(s).", opts.term, hits.len());
+        ExitCode::SUCCESS
+    }
+}
+
+/// Try every candidate URL and print a compact diagnostic per variant so we can
+/// empirically pick the one that returns English.
+fn probe(client: &Client, urls: &[String], term: &str) -> ExitCode {
+    println!("PROBE — {} variant(s)\n", urls.len());
+    let mut any = false;
+    for url in urls {
+        print!("• {url}\n  ");
+        match fetch_quiet(client, url) {
+            Ok((status, body)) => {
+                any = true;
+                let lang = detect_lang(&body);
+                let title = json_title(&body).unwrap_or_else(|| "<no json title>".into());
+                let hits = find_ci_ascii(&body, term).len();
+                println!(
+                    "status={status} lang={lang} bytes={} \"{term}\"x{hits}\n  title: {}",
+                    body.len(),
+                    truncate(&title, 90)
+                );
+            }
+            Err(e) => println!("FAILED: {e}"),
+        }
+        println!();
+    }
+    if any {
+        println!("Pick the variant whose lang=en and title reads in English; tell me which\nquery-param worked and I'll make it the default.");
         ExitCode::SUCCESS
     } else {
-        println!("RESULT: \"{term}\" NOT found.");
-        // Exit 2 => reachable but no match, distinct from network failure (1).
-        ExitCode::from(2)
+        ExitCode::FAILURE
     }
 }
 
-/// Build the candidate URLs for a numeric notice id: JSON API first, then the
-/// human share page as a fallback.
-fn targets_for_id(id: &str) -> Vec<String> {
-    vec![
-        format!("https://api-manager.upbit.com/api/v1/announcements/{id}?os=web"),
-        format!("https://www.upbit.com/service_center/notice?id={id}&view=share"),
-    ]
+/// Candidate endpoints for a numeric id, English-first. Upbit's web client uses
+/// a language query param; the exact name varies, so we try the common ones and
+/// fall back to the bare endpoint (which English `Accept-Language` may still
+/// flip).
+fn candidates(id: &str, lang: Lang) -> Vec<String> {
+    let base = format!("https://api-manager.upbit.com/api/v1/announcements/{id}");
+    match lang {
+        Lang::En => vec![
+            format!("{base}?os=web&language=en"),
+            format!("{base}?os=web&lang=en"),
+            format!("{base}?os=web&locale=en"),
+            format!("{base}?os=web"),
+        ],
+        Lang::Ko => vec![format!("{base}?os=web")],
+    }
 }
 
-fn build_client() -> reqwest::Result<Client> {
+fn build_client(lang: Lang) -> reqwest::Result<Client> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static(UA));
-    headers.insert(
-        ACCEPT,
-        HeaderValue::from_static("application/json, text/plain, */*"),
-    );
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json, text/plain, */*"));
     headers.insert(
         ACCEPT_LANGUAGE,
-        HeaderValue::from_static("ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"),
+        HeaderValue::from_static(lang.accept()),
     );
     headers.insert(ORIGIN, HeaderValue::from_static("https://www.upbit.com"));
     headers.insert(
@@ -133,14 +232,28 @@ fn build_client() -> reqwest::Result<Client> {
 fn fetch(client: &Client, url: &str) -> Result<String, String> {
     let resp = client.get(url).send().map_err(|e| e.to_string())?;
     let status = resp.status();
-    let body = resp.text().map_err(|e| e.to_string())?;
     println!("   status: {status}");
-    Ok(body)
+    resp.text().map_err(|e| e.to_string())
 }
 
-/// Case-insensitive (ASCII) substring search returning byte offsets into the
-/// original UTF-8 string, so offsets stay valid for context slicing even when
-/// the body mixes Korean and ASCII.
+fn fetch_quiet(client: &Client, url: &str) -> Result<(reqwest::StatusCode, String), String> {
+    let resp = client.get(url).send().map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body = resp.text().map_err(|e| e.to_string())?;
+    Ok((status, body))
+}
+
+/// Heuristic language label: any Hangul syllables => "ko", else "en".
+fn detect_lang(s: &str) -> &'static str {
+    if s.chars().any(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c)) {
+        "ko"
+    } else {
+        "en"
+    }
+}
+
+/// Case-insensitive (ASCII) substring search → byte offsets into the original
+/// UTF-8 string (so offsets stay valid for slicing a mixed Korean/ASCII body).
 fn find_ci_ascii(haystack: &str, needle: &str) -> Vec<usize> {
     let h = haystack.as_bytes();
     let n = needle.as_bytes();
@@ -159,8 +272,6 @@ fn find_ci_ascii(haystack: &str, needle: &str) -> Vec<usize> {
     out
 }
 
-/// Return a `pad`-byte window around a match, snapped to char boundaries and
-/// with newlines flattened to keep one-line output.
 fn context(s: &str, at: usize, len: usize, pad: usize) -> String {
     let mut start = at.saturating_sub(pad);
     while start > 0 && !s.is_char_boundary(start) {
@@ -173,7 +284,15 @@ fn context(s: &str, at: usize, len: usize, pad: usize) -> String {
     s[start..end].replace(['\n', '\r'], " ").trim().to_string()
 }
 
-/// If the body is JSON, walk it for the first "title" string value.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(max).collect();
+    t.push('…');
+    t
+}
+
 fn json_title(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     find_title(&v)
@@ -196,5 +315,49 @@ fn looks_like_cloudflare_block(body: &str) -> bool {
     let b = body.to_ascii_lowercase();
     b.contains("attention required")
         || b.contains("cf-error-details")
-        || b.contains("cloudflare") && b.contains("blocked")
+        || (b.contains("cloudflare") && b.contains("blocked"))
+}
+
+fn parse_args() -> Result<Opts, String> {
+    let mut positionals: Vec<String> = Vec::new();
+    let mut lang = Lang::En;
+    let mut raw = false;
+    let mut probe = false;
+
+    let mut it = std::env::args().skip(1).peekable();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--raw" => raw = true,
+            "--probe" => probe = true,
+            "-h" | "--help" => {
+                println!("usage: upbit-notice [id|url] [term] [--lang en|ko] [--probe] [--raw]");
+                std::process::exit(0);
+            }
+            "--lang" | "-l" => {
+                let v = it.next().ok_or("--lang needs a value (en|ko)")?;
+                lang = parse_lang(&v)?;
+            }
+            s if s.starts_with("--lang=") => lang = parse_lang(&s[7..])?,
+            s if s.starts_with("--") => return Err(format!("unknown flag {s}")),
+            other => positionals.push(other.to_string()),
+        }
+    }
+
+    let first = positionals.first().cloned();
+    let (target, is_url) = match first {
+        Some(u) if u.starts_with("http://") || u.starts_with("https://") => (u, true),
+        Some(id) => (id, false),
+        None => (DEFAULT_ID.to_string(), false),
+    };
+    let term = positionals.get(1).cloned().unwrap_or_else(|| DEFAULT_TERM.to_string());
+
+    Ok(Opts { target, is_url, term, lang, raw, probe })
+}
+
+fn parse_lang(s: &str) -> Result<Lang, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "en" | "english" => Ok(Lang::En),
+        "ko" | "kr" | "korean" => Ok(Lang::Ko),
+        other => Err(format!("unknown lang '{other}' (use en|ko)")),
+    }
 }
