@@ -84,72 +84,76 @@ fn main() -> ExitCode {
         }
     };
 
+    if opts.probe {
+        let urls = if opts.is_url {
+            vec![opts.target.clone()]
+        } else {
+            probe_candidates(&opts.target)
+        };
+        return probe(&client, &urls, &opts.term);
+    }
+
     let urls = if opts.is_url {
         vec![opts.target.clone()]
     } else {
         candidates(&opts.target, opts.lang)
     };
 
-    if opts.probe {
-        return probe(&client, &urls, &opts.term);
-    }
-
-    // Search mode: fetch candidates in order, keep the first that succeeds, but
-    // prefer one whose body actually reads as the requested language.
-    let mut chosen: Option<(String, String)> = None; // (url, body)
+    // Search mode: fetch the first candidate that succeeds.
+    let mut chosen: Option<(String, String)> = None; // (url, raw body)
     for url in &urls {
         println!("── GET {url}");
         match fetch(&client, url) {
-            Ok(body) => {
-                let detected = detect_lang(&body);
-                println!("   detected language: {detected}");
-                if looks_like_cloudflare_block(&body) {
+            Ok(raw) => {
+                if looks_like_cloudflare_block(&raw) {
                     println!("   ! Cloudflare challenge — IP may still be flagged");
                 }
-                let want = opts.lang.label();
-                let is_match = detected == want;
-                // Remember the first success; upgrade if a later one matches lang.
-                let upgrade = match &chosen {
-                    None => true,
-                    Some((_, prev)) => is_match && detect_lang(prev) != want,
-                };
-                if upgrade {
-                    chosen = Some((url.clone(), body));
-                }
-                if is_match {
-                    break; // got the language we wanted — stop early
-                }
+                chosen = Some((url.clone(), raw));
+                break;
             }
             Err(e) => println!("   ! fetch failed: {e}"),
         }
-        println!();
     }
 
-    let Some((url, body)) = chosen else {
+    let Some((url, raw)) = chosen else {
         eprintln!("\nAll requests failed (geo-block / network). Run where Upbit is reachable.");
         return ExitCode::FAILURE;
     };
 
+    // Pull the human fields out of the JSON and render the body as plain text.
+    let title = json_field(&raw, "title");
+    let category = json_field(&raw, "category");
+    let body_html = json_field(&raw, "body").unwrap_or_default();
+    let body_text = html_to_text(&body_html);
+    let body_lang = detect_lang(&body_text);
+
     println!("\n══ using: {url}");
-    if let Some(title) = json_title(&body) {
-        println!("   title: {title}");
+    if let Some(t) = &title {
+        println!("   title    : {t}");
     }
-    let detected = detect_lang(&body);
-    if detected != opts.lang.label() {
+    if let Some(c) = &category {
+        println!("   category : {c}");
+    }
+    println!("   body lang: {body_lang}");
+    if body_lang != opts.lang.label() {
         println!(
-            "   ! wanted {} but best response looks {detected} — \
-             run with --probe to see all variants",
+            "   ! body text reads {body_lang}, not {} — this notice may be {body_lang}-only",
             opts.lang.label()
         );
     }
+
     if opts.raw {
-        println!("\n----- raw body -----\n{body}\n--------------------\n");
+        println!("\n----- raw JSON -----\n{raw}\n--------------------");
+    }
+    if !body_text.trim().is_empty() {
+        println!("\n----- notice body -----\n{}\n-----------------------", body_text.trim());
     }
 
-    let hits = find_ci_ascii(&body, &opts.term);
-    println!("   {} byte(s), {} match(es)", body.len(), hits.len());
+    // Search the whole raw response so a hit in title/category/body all count.
+    let hits = find_ci_ascii(&raw, &opts.term);
+    println!("\n{} match(es) for \"{}\":", hits.len(), opts.term);
     for (n, &at) in hits.iter().enumerate() {
-        println!("     [{}] …{}…", n + 1, context(&body, at, opts.term.len(), 70));
+        println!("  [{}] …{}…", n + 1, context(&raw, at, opts.term.len(), 70));
     }
 
     println!("\n══════════════════════════════════════════");
@@ -170,14 +174,14 @@ fn probe(client: &Client, urls: &[String], term: &str) -> ExitCode {
     for url in urls {
         print!("• {url}\n  ");
         match fetch_quiet(client, url) {
-            Ok((status, body)) => {
+            Ok((status, raw)) => {
                 any = true;
-                let lang = detect_lang(&body);
-                let title = json_title(&body).unwrap_or_else(|| "<no json title>".into());
-                let hits = find_ci_ascii(&body, term).len();
+                let body_lang = detect_lang(&html_to_text(&json_field(&raw, "body").unwrap_or_default()));
+                let title = json_field(&raw, "title").unwrap_or_else(|| "<no title>".into());
+                let category = json_field(&raw, "category").unwrap_or_else(|| "?".into());
+                let hits = find_ci_ascii(&raw, term).len();
                 println!(
-                    "status={status} lang={lang} bytes={} \"{term}\"x{hits}\n  title: {}",
-                    body.len(),
+                    "status={status} body_lang={body_lang} category={category} \"{term}\"x{hits}\n  title: {}",
                     truncate(&title, 90)
                 );
             }
@@ -186,28 +190,32 @@ fn probe(client: &Client, urls: &[String], term: &str) -> ExitCode {
         println!();
     }
     if any {
-        println!("Pick the variant whose lang=en and title reads in English; tell me which\nquery-param worked and I'll make it the default.");
+        println!("The variant with body_lang=en is the English one.");
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
 }
 
-/// Candidate endpoints for a numeric id, English-first. Upbit's web client uses
-/// a language query param; the exact name varies, so we try the common ones and
-/// fall back to the bare endpoint (which English `Accept-Language` may still
-/// flip).
+/// Endpoint for a numeric id. Confirmed: `?os=web&language=en` returns the
+/// English title/category/body (e.g. title "Market Support for Re(RE) …",
+/// category "Trade"); `language=ko` (or the bare endpoint) returns Korean.
 fn candidates(id: &str, lang: Lang) -> Vec<String> {
     let base = format!("https://api-manager.upbit.com/api/v1/announcements/{id}");
-    match lang {
-        Lang::En => vec![
-            format!("{base}?os=web&language=en"),
-            format!("{base}?os=web&lang=en"),
-            format!("{base}?os=web&locale=en"),
-            format!("{base}?os=web"),
-        ],
-        Lang::Ko => vec![format!("{base}?os=web")],
-    }
+    vec![format!("{base}?os=web&language={}", lang.label())]
+}
+
+/// The full set of variants to try in `--probe` mode, so we can re-verify the
+/// language switch on any notice.
+fn probe_candidates(id: &str) -> Vec<String> {
+    let base = format!("https://api-manager.upbit.com/api/v1/announcements/{id}");
+    vec![
+        format!("{base}?os=web&language=en"),
+        format!("{base}?os=web&lang=en"),
+        format!("{base}?os=web&locale=en"),
+        format!("{base}?os=web&language=ko"),
+        format!("{base}?os=web"),
+    ]
 }
 
 fn build_client(lang: Lang) -> reqwest::Result<Client> {
@@ -243,9 +251,20 @@ fn fetch_quiet(client: &Client, url: &str) -> Result<(reqwest::StatusCode, Strin
     Ok((status, body))
 }
 
-/// Heuristic language label: any Hangul syllables => "ko", else "en".
+/// Language label by dominant script: more Hangul than Latin letters => "ko".
+/// Run this on the rendered body TEXT, not the raw JSON (whose English keys
+/// would skew the count).
 fn detect_lang(s: &str) -> &'static str {
-    if s.chars().any(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c)) {
+    let mut ko = 0usize;
+    let mut en = 0usize;
+    for c in s.chars() {
+        if ('\u{AC00}'..='\u{D7A3}').contains(&c) {
+            ko += 1;
+        } else if c.is_ascii_alphabetic() {
+            en += 1;
+        }
+    }
+    if ko > en {
         "ko"
     } else {
         "en"
@@ -293,22 +312,84 @@ fn truncate(s: &str, max: usize) -> String {
     t
 }
 
-fn json_title(body: &str) -> Option<String> {
+/// First string value for `key` anywhere in the JSON body (depth-first).
+fn json_field(body: &str, key: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    find_title(&v)
+    find_field(&v, key)
 }
 
-fn find_title(v: &serde_json::Value) -> Option<String> {
+fn find_field(v: &serde_json::Value, key: &str) -> Option<String> {
     match v {
         serde_json::Value::Object(map) => {
-            if let Some(serde_json::Value::String(t)) = map.get("title") {
-                return Some(t.clone());
+            if let Some(serde_json::Value::String(s)) = map.get(key) {
+                return Some(s.clone());
             }
-            map.values().find_map(find_title)
+            map.values().find_map(|x| find_field(x, key))
         }
-        serde_json::Value::Array(arr) => arr.iter().find_map(find_title),
+        serde_json::Value::Array(arr) => arr.iter().find_map(|x| find_field(x, key)),
         _ => None,
     }
+}
+
+/// Strip HTML to readable text: block/break tags become newlines, other tags
+/// are dropped, then HTML entities are unescaped. Good enough for notice bodies.
+fn html_to_text(html: &str) -> String {
+    let mut out = String::new();
+    let mut chars = html.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '<' {
+            let mut tag = String::new();
+            for n in chars.by_ref() {
+                if n == '>' {
+                    break;
+                }
+                tag.push(n);
+            }
+            let name: String = tag
+                .trim()
+                .trim_start_matches('/')
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if matches!(
+                name.as_str(),
+                "br" | "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "ul" | "ol"
+            ) {
+                out.push('\n');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    // Collapse runs of 3+ newlines to 2 and trim trailing spaces per line.
+    let unescaped = unescape(&out);
+    let mut result = String::new();
+    let mut blank = 0;
+    for line in unescaped.lines() {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            blank += 1;
+            if blank <= 1 {
+                result.push('\n');
+            }
+        } else {
+            blank = 0;
+            result.push_str(line.trim_start());
+            result.push('\n');
+        }
+    }
+    result
+}
+
+fn unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&") // keep last so "&amp;lt;" doesn't double-decode
 }
 
 fn looks_like_cloudflare_block(body: &str) -> bool {
