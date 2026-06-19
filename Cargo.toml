@@ -1,0 +1,21 @@
+[package]
+name = "upbit-notice"
+version = "0.1.0"
+edition = "2021"
+description = "Fetch an Upbit notice and search its text for a phrase (default: \"Market Support\")"
+
+[[bin]]
+name = "upbit-notice"
+path = "src/main.rs"
+
+[dependencies]
+# rustls-tls => no system OpenSSL needed; gzip/br/deflate => decode Cloudflare-compressed bodies.
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+    "gzip",
+    "brotli",
+    "deflate",
+] }
+serde_json = "1"
