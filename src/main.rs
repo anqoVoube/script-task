@@ -1,19 +1,21 @@
-//! Fetch an Upbit notice and report whether a phrase (default "Market Support")
-//! appears in it — preferring the English rendering.
+//! Fetch an Upbit notice and print its title — in English by default.
 //!
 //! The public page (www.upbit.com/service_center/notice?id=N) is an empty React
 //! shell; the real title/body comes from the api-manager JSON API. That API
-//! serves Korean by default. To get English we try, in order, the language
-//! query-param variants Upbit's web client uses and an English `Accept-Language`
-//! header, then pick whichever response actually comes back in English.
+//! serves Korean by default; `?os=web&language=en` returns English.
+//!
+//! The title is printed to STDOUT (clean, one line, script-friendly). All
+//! diagnostics — the URL, status, category, and any --match results — go to
+//! STDERR, so `upbit-notice 6303` pipes the bare title.
 //!
 //! Usage:
-//!   upbit-notice                              # id 6303, "Market Support", English
-//!   upbit-notice 6303 "Market Support"
-//!   upbit-notice 6303 --lang ko               # force Korean
-//!   upbit-notice 6303 --probe                 # try every variant, show a table
-//!   upbit-notice 6303 --raw                   # also dump the chosen response body
-//!   upbit-notice "<full-url>" "phrase"
+//!   upbit-notice                       # id 6303, English title
+//!   upbit-notice 6303                  # explicit id
+//!   upbit-notice 6303 --lang ko        # Korean title
+//!   upbit-notice 6303 --body           # also print the body text
+//!   upbit-notice 6303 --match "Market Support"   # also report phrase hits (stderr)
+//!   upbit-notice 6303 --probe          # try every endpoint variant
+//!   upbit-notice "<full-url>"
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -54,10 +56,11 @@ impl Lang {
 struct Opts {
     target: String, // numeric id or a full URL
     is_url: bool,
-    term: String,
     lang: Lang,
     raw: bool,
+    body: bool,
     probe: bool,
+    match_term: Option<String>, // optional phrase to additionally search for
 }
 
 fn main() -> ExitCode {
@@ -69,12 +72,8 @@ fn main() -> ExitCode {
         }
     };
 
-    println!(
-        "Target : {}\nPhrase : \"{}\" (case-insensitive)\nLang   : {}\n",
-        opts.target,
-        opts.term,
-        opts.lang.label()
-    );
+    // Diagnostics go to stderr so stdout carries only the title (script-friendly).
+    eprintln!("[target {} | lang {}]", opts.target, opts.lang.label());
 
     let client = match build_client(opts.lang) {
         Ok(c) => c,
@@ -85,12 +84,13 @@ fn main() -> ExitCode {
     };
 
     if opts.probe {
+        let term = opts.match_term.clone().unwrap_or_else(|| DEFAULT_TERM.to_string());
         let urls = if opts.is_url {
             vec![opts.target.clone()]
         } else {
             probe_candidates(&opts.target)
         };
-        return probe(&client, &urls, &opts.term);
+        return probe(&client, &urls, &term);
     }
 
     let urls = if opts.is_url {
@@ -99,71 +99,65 @@ fn main() -> ExitCode {
         candidates(&opts.target, opts.lang)
     };
 
-    // Search mode: fetch the first candidate that succeeds.
+    // Fetch the first candidate that succeeds.
     let mut chosen: Option<(String, String)> = None; // (url, raw body)
     for url in &urls {
-        println!("── GET {url}");
+        eprintln!("── GET {url}");
         match fetch(&client, url) {
             Ok(raw) => {
                 if looks_like_cloudflare_block(&raw) {
-                    println!("   ! Cloudflare challenge — IP may still be flagged");
+                    eprintln!("   ! Cloudflare challenge — IP may still be flagged");
                 }
                 chosen = Some((url.clone(), raw));
                 break;
             }
-            Err(e) => println!("   ! fetch failed: {e}"),
+            Err(e) => eprintln!("   ! fetch failed: {e}"),
         }
     }
 
-    let Some((url, raw)) = chosen else {
-        eprintln!("\nAll requests failed (geo-block / network). Run where Upbit is reachable.");
+    let Some((_url, raw)) = chosen else {
+        eprintln!("All requests failed (geo-block / network). Run where Upbit is reachable.");
         return ExitCode::FAILURE;
     };
 
-    // Pull the human fields out of the JSON and render the body as plain text.
     let title = json_field(&raw, "title");
     let category = json_field(&raw, "category");
-    let body_html = json_field(&raw, "body").unwrap_or_default();
-    let body_text = html_to_text(&body_html);
-    let body_lang = detect_lang(&body_text);
 
-    println!("\n══ using: {url}");
-    if let Some(t) = &title {
-        println!("   title    : {t}");
+    // The title is the product: print it to stdout, plainly.
+    match &title {
+        Some(t) => println!("{t}"),
+        None => {
+            eprintln!("error: no 'title' field in response (run with --raw to inspect)");
+            if opts.raw {
+                eprintln!("----- raw JSON -----\n{raw}\n--------------------");
+            }
+            return ExitCode::from(2);
+        }
     }
     if let Some(c) = &category {
-        println!("   category : {c}");
-    }
-    println!("   body lang: {body_lang}");
-    if body_lang != opts.lang.label() {
-        println!(
-            "   ! body text reads {body_lang}, not {} — this notice may be {body_lang}-only",
-            opts.lang.label()
-        );
+        eprintln!("[category {c}]");
     }
 
+    if opts.body {
+        let body_text = html_to_text(&json_field(&raw, "body").unwrap_or_default());
+        if !body_text.trim().is_empty() {
+            println!("\n{}", body_text.trim());
+        }
+    }
     if opts.raw {
-        println!("\n----- raw JSON -----\n{raw}\n--------------------");
-    }
-    if !body_text.trim().is_empty() {
-        println!("\n----- notice body -----\n{}\n-----------------------", body_text.trim());
+        eprintln!("----- raw JSON -----\n{raw}\n--------------------");
     }
 
-    // Search the whole raw response so a hit in title/category/body all count.
-    let hits = find_ci_ascii(&raw, &opts.term);
-    println!("\n{} match(es) for \"{}\":", hits.len(), opts.term);
-    for (n, &at) in hits.iter().enumerate() {
-        println!("  [{}] …{}…", n + 1, context(&raw, at, opts.term.len(), 70));
+    // Optional, opt-in only: search for a phrase when --match is given.
+    if let Some(term) = &opts.match_term {
+        let hits = find_ci_ascii(&raw, term);
+        eprintln!("[\"{}\" — {} match(es)]", term, hits.len());
+        for (n, &at) in hits.iter().enumerate() {
+            eprintln!("  [{}] …{}…", n + 1, context(&raw, at, term.len(), 70));
+        }
     }
 
-    println!("\n══════════════════════════════════════════");
-    if hits.is_empty() {
-        println!("RESULT: \"{}\" NOT found.", opts.term);
-        ExitCode::from(2)
-    } else {
-        println!("RESULT: \"{}\" FOUND — {} occurrence(s).", opts.term, hits.len());
-        ExitCode::SUCCESS
-    }
+    ExitCode::SUCCESS
 }
 
 /// Try every candidate URL and print a compact diagnostic per variant so we can
@@ -403,22 +397,40 @@ fn parse_args() -> Result<Opts, String> {
     let mut positionals: Vec<String> = Vec::new();
     let mut lang = Lang::En;
     let mut raw = false;
+    let mut body = false;
     let mut probe = false;
+    let mut match_term: Option<String> = None;
 
     let mut it = std::env::args().skip(1).peekable();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--raw" => raw = true,
+            "--body" => body = true,
             "--probe" => probe = true,
             "-h" | "--help" => {
-                println!("usage: upbit-notice [id|url] [term] [--lang en|ko] [--probe] [--raw]");
+                println!(
+                    "usage: upbit-notice [id|url] [--lang en|ko] [--body] [--match PHRASE] [--probe] [--raw]\n\
+                     \n\
+                     Prints the notice title to stdout (English by default).\n\
+                     Diagnostics and any --match results go to stderr.\n\
+                     \n\
+                       --body          also print the notice body as plain text\n\
+                       --match PHRASE  also report occurrences of PHRASE (case-insensitive)\n\
+                       --lang en|ko    language (default en)\n\
+                       --probe         try all endpoint variants and show a diagnostic table\n\
+                       --raw           dump the raw JSON to stderr"
+                );
                 std::process::exit(0);
             }
             "--lang" | "-l" => {
                 let v = it.next().ok_or("--lang needs a value (en|ko)")?;
                 lang = parse_lang(&v)?;
             }
+            "--match" | "-m" => {
+                match_term = Some(it.next().ok_or("--match needs a PHRASE")?);
+            }
             s if s.starts_with("--lang=") => lang = parse_lang(&s[7..])?,
+            s if s.starts_with("--match=") => match_term = Some(s[8..].to_string()),
             s if s.starts_with("--") => return Err(format!("unknown flag {s}")),
             other => positionals.push(other.to_string()),
         }
@@ -430,9 +442,8 @@ fn parse_args() -> Result<Opts, String> {
         Some(id) => (id, false),
         None => (DEFAULT_ID.to_string(), false),
     };
-    let term = positionals.get(1).cloned().unwrap_or_else(|| DEFAULT_TERM.to_string());
 
-    Ok(Opts { target, is_url, term, lang, raw, probe })
+    Ok(Opts { target, is_url, lang, raw, body, probe, match_term })
 }
 
 fn parse_lang(s: &str) -> Result<Lang, String> {
