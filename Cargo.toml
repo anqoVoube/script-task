@@ -2,14 +2,22 @@
 name = "upbit-notice"
 version = "0.1.0"
 edition = "2021"
-description = "Fetch an Upbit notice and search its text for a phrase (default: \"Market Support\")"
+description = "Fetch Upbit notices: print a title, or watch for new notices and push them to Telegram"
 
+# Existing one-shot title printer.
 [[bin]]
 name = "upbit-notice"
 path = "src/main.rs"
 
+# New: poll the Upbit announcements list and push new notices to Telegram.
+[[bin]]
+name = "upbit-telegram"
+path = "src/bin/telegram.rs"
+
 [dependencies]
-# rustls-tls => no system OpenSSL needed; gzip/br/deflate => decode Cloudflare-compressed bodies.
+# rustls-tls => no system OpenSSL; gzip/br/deflate => decode Cloudflare-compressed
+# bodies. "blocking" powers the title printer; the async Client (used by the
+# watcher) is available with these same features.
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "json",
@@ -19,3 +27,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "deflate",
 ] }
 serde_json = "1"
+# teloxide for the Telegram push. rustls backend keeps TLS pure-Rust and aligned
+# with reqwest's rustls-tls (no native-tls / OpenSSL pulled in).
+teloxide = { version = "0.17", default-features = false, features = ["rustls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
